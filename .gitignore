@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+data/
+static/uploads/*
+!static/uploads/.gitkeep

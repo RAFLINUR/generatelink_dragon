@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dragon OG Link &mdash; News Link Generator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <span class="brand-mark">D</span>
+        <div>
+          <strong>Dragon OG Link</strong>
+          <span class="brand-sub">Custom Open Graph News Link Generator</span>
+        </div>
+      </div>
+      <span class="badge">Powered by Flask &amp; SQLite</span>
+    </div>
+  </header>
+
+  <main class="container page">
+    <section class="hero">
+      <div>
+        <h1>Buat link berita dengan preview sendiri</h1>
+        <p>Cukup tempel Target Link. Metadata Open Graph diambil otomatis dari halaman tersebut, lalu Anda bisa memilih sendiri path shortened-nya.</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><span class="stat-value">{{ total_links }}</span><span class="stat-label">Total link</span></div>
+        <div class="stat"><span class="stat-value">{{ total_clicks }}</span><span class="stat-label">Total klik</span></div>
+      </div>
+    </section>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flashes">
+          {% for category, message in messages %}
+            <div class="flash flash-{{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Buat link baru</h2>
+        <p>Hanya 2 kolom. Target Link wajib diisi.</p>
+      </div>
+
+      <form method="post" action="{{ url_for('create') }}" class="form">
+        <div class="field full">
+          <label for="target_url">Target Link *</label>
+          <input type="url" id="target_url" name="target_url" placeholder="https://portalberita.com/artikel/utama" value="{{ request.form.get('target_url', '') }}" required>
+          <span class="hint">Harus diawali <code>http://</code> atau <code>https://</code>. Judul, deskripsi, gambar, dan nama portal diambil otomatis.</span>
+        </div>
+
+        <div class="field full">
+          <label for="custom_path">Custom Link</label>
+          <div class="input-prefix">
+            <span class="prefix">{{ request.host_url }}</span>
+            <input type="text" id="custom_path" name="custom_path" placeholder="tribun/berita-viral" value="{{ request.form.get('custom_path', '') }}" maxlength="120">
+          </div>
+          <span class="hint">Bebas: 1 kata atau pakai <code>/</code> untuk bertingkat. Tanpa awalan <code>/berita/</code>. Kosongkan untuk 6 karakter acak.</span>
+        </div>
+
+        <div class="field full actions">
+          <button type="submit" class="btn btn-primary">Buat Link</button>
+          <button type="reset" class="btn btn-ghost">Reset Form</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Riwayat link</h2>
+        <p>Salin Custom Link lalu bagikan ke mana saja.</p>
+      </div>
+
+      {% if links %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Custom Link</th>
+                <th>Target Link</th>
+                <th class="center">Jumlah Klik</th>
+                <th class="center">Aksi</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for link in links %}
+                <tr>
+                  <td>
+                    <div class="copy-group">
+                      <a class="short-link" href="/{{ link.custom_path }}" target="_blank" rel="noopener noreferrer">/{{ link.custom_path }}</a>
+                      <button type="button" class="btn btn-small btn-ghost copy-btn" data-copy="{{ request.host_url }}{{ link.custom_path }}" onclick="copyLink(this)">Copy</button>
+                    </div>
+                  </td>
+                  <td>
+                    <a class="cell-url" href="{{ link.target_url }}" target="_blank" rel="noopener noreferrer" title="{{ link.target_url }}">{{ link.target_url }}</a>
+                  </td>
+                  <td class="center"><span class="click-pill">{{ link.clicks }}</span></td>
+                  <td class="center">
+                    <form method="post" action="{{ url_for('delete', link_id=link.id) }}">
+                      <button type="submit" class="btn btn-small btn-danger">Hapus</button>
+                    </form>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty">
+          <span class="empty-icon">&#128202;</span>
+          <strong>Belum ada link.</strong>
+          <span>Isi form di atas untuk membuat link pertama Anda.</span>
+        </div>
+      {% endif %}
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">&copy; 2026 Dragon OG Link &middot; Dibuat untuk Dragon, Owner Dragon.</div>
+  </footer>
+
+  <script>
+    function copyLink(button) {
+      var text = button.getAttribute('data-copy');
+      var done = function () {
+        var label = button.textContent;
+        button.textContent = 'Tersalin';
+        setTimeout(function () { button.textContent = label; }, 1200);
+      };
+      var fallback = function () {
+        var area = document.createElement('textarea');
+        area.value = text;
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand('copy'); done(); } catch (error) {}
+        document.body.removeChild(area);
+      };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(done).catch(fallback);
+      } else {
+        fallback();
+      }
+    }
+  </script>
+</body>
+</html>

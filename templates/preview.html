@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ link.title }}</title>
+
+  <!-- Metadata Open Graph hasil auto-fetch dari Target Link -->
+  <meta property="og:type" content="article" />
+  <meta property="og:title" content="{{ link.title }}" />
+  <meta property="og:description" content="{{ link.description }}" />
+  <meta property="og:image" content="{{ link.og_image }}" />
+  <meta property="og:site_name" content="{{ link.site_name }}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="{{ link.title }}" />
+  <meta name="twitter:description" content="{{ link.description }}" />
+  <meta name="twitter:image" content="{{ link.og_image }}" />
+
+  <!-- Redirect hanya untuk manusia; crawler tetap menerima meta tag tanpa redirect. -->
+  {% if not is_bot %}
+  <meta http-equiv="refresh" content="1;url={{ link.target_url }}" />
+  {% endif %}
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="preview-body">
+  <main class="preview-wrap">
+    <article class="preview-card">
+      <div class="preview-source">
+        <span class="source-dot"></span>
+        {{ link.site_name }}
+      </div>
+
+      {% if link.og_image %}
+        <img class="preview-image" src="{{ link.og_image }}" alt="Thumbnail {{ link.title }}">
+      {% endif %}
+
+      <div class="preview-content">
+        <h1>{{ link.title }}</h1>
+        {% if link.description %}
+          <p class="preview-description">{{ link.description }}</p>
+        {% endif %}
+
+        {% if is_bot %}
+          <p class="preview-note">Halaman pratinjau Open Graph. Meta tag siap dibagikan ke media sosial.</p>
+        {% else %}
+          <div class="loading">
+            <span class="spinner" aria-hidden="true"></span>
+            <span>Mengarahkan ke Target Link&hellip;</span>
+          </div>
+          <a class="btn btn-primary preview-cta" href="{{ link.target_url }}" rel="noopener noreferrer">Lanjutkan membaca &rarr;</a>
+          <p class="preview-note">Jika tidak otomatis berpindah, klik tombol di atas.</p>
+        {% endif %}
+      </div>
+    </article>
+    <p class="preview-footer">Short URL: <strong>/{{ link.custom_path }}</strong></p>
+  </main>
+</body>
+</html>
