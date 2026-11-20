@@ -230,6 +230,10 @@ class LibSQLStore:
     """Turso/libSQL remote — query SQL identik dengan SQLite."""
 
     def __init__(self, url, token):
+        # Turso saat ini melayani hrana lewat HTTPS; transport WebSocket
+        # (libsql://) bisa ditolak 400, jadi normalisasi ke https://.
+        if url.startswith("libsql://"):
+            url = "https://" + url[len("libsql://") :]
         self._client = libsql_client.create_client_sync(url=url, auth_token=token)
 
     def init(self):

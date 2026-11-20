@@ -33,7 +33,8 @@ Environment variable di Vercel:
 | `SECRET_KEY` | string acak untuk session Flask |
 
 Deploy lewat import repo GitHub atau `vercel --prod`. Schema dan index unik
-`custom_path` dibuat otomatis.
+`custom_path` dibuat otomatis. Adapter otomatis mengubah `libsql://` menjadi
+`https://` karena transport WebSocket bisa ditolak 400.
 
 Salin 3 link lokal ke Turso:
 
