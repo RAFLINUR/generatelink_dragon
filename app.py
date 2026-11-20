@@ -13,6 +13,7 @@ import sqlite3
 import string
 from urllib.parse import urljoin, urlparse
 
+import libsql_client
 import requests
 from bs4 import BeautifulSoup
 from flask import (
@@ -30,6 +31,11 @@ app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY", "dragon-og-generator-secret-key"),
     DATABASE=os.path.join(app.root_path, "data", "links.db"),
+    # Jika diset (mis. di Vercel), pakai Turso/libSQL sebagai DB permanen.
+    REMOTE_DATABASE_URL=(
+        os.environ.get("TURSO_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
+    ),
+    REMOTE_DATABASE_TOKEN=os.environ.get("TURSO_AUTH_TOKEN") or "",
 )
 
 CUSTOM_PATH_PATTERN = re.compile(r"^[\w./~-]+$", re.UNICODE)
@@ -109,13 +115,49 @@ NOT_NULL_FALLBACKS = {
 
 
 # ---------------------------------------------------------------------------
-# Database (dibuat & dimigrasi otomatis saat aplikasi dijalankan)
+# Database (lokal: SQLite | Vercel: Turso/libSQL)
 # ---------------------------------------------------------------------------
+class RemoteCursor:
+    """Cursor minimal dengan interface yang sama seperti sqlite3.Cursor."""
+
+    def __init__(self, result):
+        self._rows = [row.asdict() for row in result.rows]
+        self.lastrowid = result.last_insert_rowid
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
+class RemoteConnection:
+    """Adapter libSQL agar kode query SQLite tetap bisa dipakai apa adanya."""
+
+    def __init__(self, url, token):
+        self._client = libsql_client.create_client_sync(url=url, auth_token=token)
+
+    def execute(self, sql, params=()):
+        return RemoteCursor(self._client.execute(sql, list(params)))
+
+    def commit(self):
+        pass  # Koneksi remote berjalan dalam mode autocommit.
+
+    def close(self):
+        self._client.close()
+
+
 def get_db():
-    """Buka koneksi SQLite khusus untuk request saat ini."""
+    """Buka koneksi database khusus untuk request saat ini."""
     if "db" not in g:
-        g.db = sqlite3.connect(app.config["DATABASE"])
-        g.db.row_factory = sqlite3.Row
+        if app.config["REMOTE_DATABASE_URL"]:
+            g.db = RemoteConnection(
+                app.config["REMOTE_DATABASE_URL"],
+                app.config["REMOTE_DATABASE_TOKEN"],
+            )
+        else:
+            g.db = sqlite3.connect(app.config["DATABASE"])
+            g.db.row_factory = sqlite3.Row
     return g.db
 
 
@@ -128,6 +170,18 @@ def close_db(error=None):
 
 def init_db():
     """Buat tabel baru atau migrasi skema lama tanpa kehilangan data."""
+    if app.config["REMOTE_DATABASE_URL"]:
+        db = RemoteConnection(
+            app.config["REMOTE_DATABASE_URL"],
+            app.config["REMOTE_DATABASE_TOKEN"],
+        )
+        try:
+            db.execute(SCHEMA_SQL)
+            db.commit()
+        finally:
+            db.close()
+        return
+
     os.makedirs(os.path.dirname(app.config["DATABASE"]), exist_ok=True)
 
     # Koneksi sendiri agar bisa dipanggil di luar application context.
