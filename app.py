@@ -286,6 +286,9 @@ class LibSQLStore:
     def delete(self, link_id):
         self._client.execute("DELETE FROM links WHERE id = ?", [link_id])
 
+    def close(self):
+        self._client.close()
+
 
 _store = None
 _store_ready = False

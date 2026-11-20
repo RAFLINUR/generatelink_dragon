@@ -26,4 +26,5 @@ for row in source.list_links():
     destination.insert({field: row.get(field) for field in LINK_FIELDS})
     copied += 1
 
+destination.close()
 print("Berhasil menyalin {} link ke Turso.".format(copied))

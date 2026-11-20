@@ -3,3 +3,8 @@ __pycache__/
 data/
 static/uploads/*
 !static/uploads/.gitkeep
+
+# Rahasia: jangan pernah commit token database / kunci session
+.env
+.env.*
+!.env.example
