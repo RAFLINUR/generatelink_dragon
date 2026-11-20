@@ -1,6 +1,6 @@
 # generatelink_dragon
 
-Custom Open Graph News Link Generator — Flask + SQLite (lokal) / MongoDB Atlas (Vercel).
+Custom Open Graph News Link Generator — Flask + SQLite (lokal) / Turso libSQL / MongoDB Atlas.
 
 ## Jalankan lokal
 
@@ -10,38 +10,55 @@ python3 app.py
 ```
 
 Buka http://localhost:5000. Database lokal dibuat otomatis di `data/links.db`.
-Tanpa `MONGODB_URI`, aplikasi selalu memakai SQLite lokal.
+Tanpa env var database, aplikasi selalu memakai SQLite lokal.
 
 ## Deploy ke Vercel
 
-Filesystem serverless bersifat ephemeral, jadi data permanen disimpan di
-**MongoDB Atlas**. `vercel.json` sudah menangani build `@vercel/python`, routing
-dinamis `/<path:custom_path>`, dan file static.
+Filesystem serverless bersifat ephemeral, jadi data permanen disimpan di database
+eksternal. Prioritas otomatis: **Turso → MongoDB → SQLite lokal**.
 
-1. Buat cluster gratis di https://mongodb.com/atlas (login dengan GitHub bisa).
-2. Buat database user, lalu whitelist IP `0.0.0.0/0` (diperlukan Vercel).
-3. Salin connection string `mongodb+srv://...`.
-4. Di Vercel → Project → Settings → Environment Variables, tambahkan:
+### Turso (dipakai sekarang)
 
-   | Key | Value |
-   |---|---|
-   | `MONGODB_URI` | connection string Atlas |
-   | `MONGODB_DB` | `generatelink_dragon` |
-   | `SECRET_KEY` | string acak untuk session Flask |
-
-5. Deploy lewat import repo GitHub atau `vercel --prod`.
-
-Index unik pada `custom_path` dan counter ID dibuat otomatis. Untuk memindahkan
-link lama dari SQLite lokal:
+Database dibuat di primary region Singapore (`aws-ap-southeast-1`) agar dekat
+dengan audiens Indonesia. `vercel.json` juga memakai region `sin1` agar
+function dan database satu region.
 
 ```bash
-MONGODB_URI=... python3 migrate_to_mongo.py
+turso group create --location aws-ap-southeast-1 dragon-group
+turso db create --group dragon-group generatelink_dragon
 ```
+
+Environment variable di Vercel:
+
+| Key | Value |
+|---|---|
+| `TURSO_DATABASE_URL` | `libsql://<db>.aws-ap-southeast-1.turso.io` |
+| `TURSO_AUTH_TOKEN` | token database dari Turso |
+| `SECRET_KEY` | string acak untuk session Flask |
+
+Salin 3 link lokal ke Turso:
+
+```bash
+TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... python3 migrate_to_turso.py
+```
+
+### Alternatif MongoDB Atlas
+
+Kosongkan `TURSO_DATABASE_URL`, lalu isi:
+
+| Key | Value |
+|---|---|
+| `MONGODB_URI` | `mongodb+srv://...` |
+| `MONGODB_DB` | `generatelink_dragon` |
+
+Migrasi: `MONGODB_URI=... python3 migrate_to_mongo.py`
 
 ## Environment variable
 
 | Nama | Wajib | Keterangan |
 |---|---|---|
-| `MONGODB_URI` | untuk Vercel | Kosongkan untuk memakai SQLite lokal |
+| `TURSO_DATABASE_URL` | untuk Vercel | Kosongkan untuk memakai SQLite/MongoDB |
+| `TURSO_AUTH_TOKEN` | untuk Vercel | Token akses Turso |
+| `MONGODB_URI` | opsional | Dipakai jika Turso tidak diset |
 | `MONGODB_DB` | opsional | Default: `generatelink_dragon` |
 | `SECRET_KEY` | disarankan | Kunci session Flask |

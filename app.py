@@ -2,8 +2,8 @@
 
  oleh: Dragon (Owner Dragon)
 
- Penyimpanan: SQLite (lokal) atau MongoDB Atlas (Vercel), dipilih otomatis
- lewat environment variable MONGODB_URI. Metadata Open Graph diambil otomatis
+ Penyimpanan: SQLite (lokal), Turso/libSQL, atau MongoDB Atlas — dipilih
+ otomatis lewat environment variable. Metadata Open Graph diambil otomatis
  dari Target Link saat link dibuat.
 """
 
@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
+import libsql_client
 import requests
 from bs4 import BeautifulSoup
 from flask import (
@@ -35,6 +36,10 @@ app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY", "dragon-og-generator-secret-key"),
     DATABASE=os.path.join(app.root_path, "data", "links.db"),
+    TURSO_DATABASE_URL=(
+        os.environ.get("TURSO_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
+    ),
+    TURSO_AUTH_TOKEN=os.environ.get("TURSO_AUTH_TOKEN") or "",
     MONGODB_URI=(
         os.environ.get("MONGODB_URI") or os.environ.get("MONGODB_URL") or ""
     ),
@@ -227,6 +232,63 @@ class SQLiteStore:
             db.commit()
 
 
+class LibSQLStore:
+    """Turso/libSQL remote — query SQL identik dengan SQLite."""
+
+    def __init__(self, url, token):
+        self._client = libsql_client.create_client_sync(url=url, auth_token=token)
+
+    def init(self):
+        self._client.execute(SCHEMA_SQL)
+
+    @staticmethod
+    def _rows(result):
+        return [row.asdict() for row in result.rows]
+
+    def list_links(self):
+        result = self._client.execute(
+            "SELECT * FROM links ORDER BY created_at DESC, id DESC"
+        )
+        return self._rows(result)
+
+    def find_by_path(self, custom_path):
+        result = self._client.execute(
+            "SELECT * FROM links WHERE custom_path = ? LIMIT 1", [custom_path]
+        )
+        rows = self._rows(result)
+        return rows[0] if rows else None
+
+    def find_by_id(self, link_id):
+        result = self._client.execute(
+            "SELECT * FROM links WHERE id = ? LIMIT 1", [link_id]
+        )
+        rows = self._rows(result)
+        return rows[0] if rows else None
+
+    def path_exists(self, custom_path):
+        result = self._client.execute(
+            "SELECT 1 FROM links WHERE custom_path = ? LIMIT 1", [custom_path]
+        )
+        return bool(result.rows)
+
+    def insert(self, data):
+        columns = ", ".join(LINK_FIELDS)
+        placeholders = ", ".join("?" for _ in LINK_FIELDS)
+        result = self._client.execute(
+            "INSERT INTO links ({0}) VALUES ({1})".format(columns, placeholders),
+            [data.get(field, "") for field in LINK_FIELDS],
+        )
+        return result.last_insert_rowid
+
+    def increment_clicks(self, link_id):
+        self._client.execute(
+            "UPDATE links SET clicks = clicks + 1 WHERE id = ?", [link_id]
+        )
+
+    def delete(self, link_id):
+        self._client.execute("DELETE FROM links WHERE id = ?", [link_id])
+
+
 class MongoStore:
     """MongoDB Atlas. ID numerik tetap dipakai agar route /delete/<int:id> utuh."""
 
@@ -292,7 +354,12 @@ _store_ready = False
 def get_store():
     global _store, _store_ready
     if _store is None:
-        if app.config["MONGODB_URI"]:
+        if app.config["TURSO_DATABASE_URL"]:
+            _store = LibSQLStore(
+                app.config["TURSO_DATABASE_URL"],
+                app.config["TURSO_AUTH_TOKEN"],
+            )
+        elif app.config["MONGODB_URI"]:
             _store = MongoStore(app.config["MONGODB_URI"], app.config["MONGODB_DB"])
         else:
             _store = SQLiteStore(app.config["DATABASE"])
@@ -300,7 +367,7 @@ def get_store():
         try:
             _store.init()
             _store_ready = True
-        except (PyMongoError, OSError, sqlite3.Error):
+        except (PyMongoError, libsql_client.LibsqlError, OSError, sqlite3.Error):
             # Dicoba lagi pada request berikutnya saat database sudah tersedia.
             pass
     return _store
