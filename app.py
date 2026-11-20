@@ -2,9 +2,9 @@
 
  oleh: Dragon (Owner Dragon)
 
- Penyimpanan: SQLite (lokal), Turso/libSQL, atau MongoDB Atlas — dipilih
- otomatis lewat environment variable. Metadata Open Graph diambil otomatis
- dari Target Link saat link dibuat.
+ Penyimpanan: SQLite untuk development lokal, Turso/libSQL untuk produksi
+ (Vercel). Metadata Open Graph diambil otomatis dari Target Link saat link
+ dibuat.
 """
 
 import os
@@ -29,8 +29,6 @@ from flask import (
     request,
     url_for,
 )
-from pymongo import MongoClient, ReturnDocument
-from pymongo.errors import PyMongoError
 
 app = Flask(__name__)
 app.config.update(
@@ -40,10 +38,6 @@ app.config.update(
         os.environ.get("TURSO_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
     ),
     TURSO_AUTH_TOKEN=os.environ.get("TURSO_AUTH_TOKEN") or "",
-    MONGODB_URI=(
-        os.environ.get("MONGODB_URI") or os.environ.get("MONGODB_URL") or ""
-    ),
-    MONGODB_DB=os.environ.get("MONGODB_DB") or "generatelink_dragon",
 )
 
 CUSTOM_PATH_PATTERN = re.compile(r"^[\w./~-]+$", re.UNICODE)
@@ -132,7 +126,7 @@ LINK_FIELDS = (
 
 
 # ---------------------------------------------------------------------------
-# Storage layer: satu interface untuk SQLite lokal dan MongoDB
+# Storage layer: satu interface untuk SQLite lokal dan Turso/libSQL
 # ---------------------------------------------------------------------------
 class SQLiteStore:
     def __init__(self, path):
@@ -289,64 +283,6 @@ class LibSQLStore:
         self._client.execute("DELETE FROM links WHERE id = ?", [link_id])
 
 
-class MongoStore:
-    """MongoDB Atlas. ID numerik tetap dipakai agar route /delete/<int:id> utuh."""
-
-    def __init__(self, uri, database_name):
-        self.client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-        self.collection = self.client[database_name]["links"]
-        self.counters = self.client[database_name]["counters"]
-
-    def init(self):
-        self.collection.create_index("custom_path", unique=True)
-
-    @staticmethod
-    def _public(document):
-        if not document:
-            return None
-        data = dict(document)
-        data.pop("_id", None)
-        return data
-
-    @staticmethod
-    def _now():
-        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-    def list_links(self):
-        documents = self.collection.find().sort([("created_at", -1), ("id", -1)])
-        return [self._public(doc) for doc in documents]
-
-    def find_by_path(self, custom_path):
-        return self._public(self.collection.find_one({"custom_path": custom_path}))
-
-    def find_by_id(self, link_id):
-        return self._public(self.collection.find_one({"id": link_id}))
-
-    def path_exists(self, custom_path):
-        return self.collection.find_one(
-            {"custom_path": custom_path}, {"_id": 1}
-        ) is not None
-
-    def insert(self, data):
-        counter = self.counters.find_one_and_update(
-            {"_id": "links"},
-            {"$inc": {"seq": 1}},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-        document = {field: data.get(field, "") for field in LINK_FIELDS}
-        document["id"] = counter["seq"]
-        document.setdefault("created_at", self._now())
-        self.collection.insert_one(document)
-        return document["id"]
-
-    def increment_clicks(self, link_id):
-        self.collection.update_one({"id": link_id}, {"$inc": {"clicks": 1}})
-
-    def delete(self, link_id):
-        self.collection.delete_one({"id": link_id})
-
-
 _store = None
 _store_ready = False
 
@@ -359,15 +295,13 @@ def get_store():
                 app.config["TURSO_DATABASE_URL"],
                 app.config["TURSO_AUTH_TOKEN"],
             )
-        elif app.config["MONGODB_URI"]:
-            _store = MongoStore(app.config["MONGODB_URI"], app.config["MONGODB_DB"])
         else:
             _store = SQLiteStore(app.config["DATABASE"])
     if not _store_ready:
         try:
             _store.init()
             _store_ready = True
-        except (PyMongoError, libsql_client.LibsqlError, OSError, sqlite3.Error):
+        except (libsql_client.LibsqlError, OSError, sqlite3.Error):
             # Dicoba lagi pada request berikutnya saat database sudah tersedia.
             pass
     return _store
