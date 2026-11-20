@@ -1,5 +1,7 @@
 # generatelink_dragon
 
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRAFLINUR%2Fgeneratelink_dragon&project-name=generatelink_dragon&repository-name=generatelink_dragon&env=TURSO_DATABASE_URL,TURSO_AUTH_TOKEN,SECRET_KEY&envDescription=Turso%20database%20URL%2C%20Turso%20auth%20token%2C%20dan%20kunci%20session%20Flask&envLink=https%3A%2F%2Fgithub.com%2FRAFLINUR%2Fgeneratelink_dragon%23environment-variable)
+
 Custom Open Graph News Link Generator — Flask + SQLite (lokal) / Turso libSQL (Vercel).
 
 ## Jalankan lokal
