@@ -1,9 +1,10 @@
-"""Custom Open Graph News Link Generator - Flask + SQLite.
+"""Custom Open Graph News Link Generator - Flask.
 
  oleh: Dragon (Owner Dragon)
 
- Form hanya berisi Target Link + Custom Link. Metadata Open Graph diambil
- otomatis dari Target Link saat link dibuat.
+ Penyimpanan: SQLite (lokal) atau MongoDB Atlas (Vercel), dipilih otomatis
+ lewat environment variable MONGODB_URI. Metadata Open Graph diambil otomatis
+ dari Target Link saat link dibuat.
 """
 
 import os
@@ -11,9 +12,10 @@ import re
 import secrets
 import sqlite3
 import string
+from contextlib import contextmanager
+from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
-import libsql_client
 import requests
 from bs4 import BeautifulSoup
 from flask import (
@@ -26,16 +28,17 @@ from flask import (
     request,
     url_for,
 )
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import PyMongoError
 
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY", "dragon-og-generator-secret-key"),
     DATABASE=os.path.join(app.root_path, "data", "links.db"),
-    # Jika diset (mis. di Vercel), pakai Turso/libSQL sebagai DB permanen.
-    REMOTE_DATABASE_URL=(
-        os.environ.get("TURSO_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
+    MONGODB_URI=(
+        os.environ.get("MONGODB_URI") or os.environ.get("MONGODB_URL") or ""
     ),
-    REMOTE_DATABASE_TOKEN=os.environ.get("TURSO_AUTH_TOKEN") or "",
+    MONGODB_DB=os.environ.get("MONGODB_DB") or "generatelink_dragon",
 )
 
 CUSTOM_PATH_PATTERN = re.compile(r"^[\w./~-]+$", re.UNICODE)
@@ -52,7 +55,6 @@ SCRAPER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# User-Agent crawler/media sosial yang harus menerima meta tag tanpa redirect.
 BOT_SIGNATURES = (
     "whatsapp",
     "facebookexternalhit",
@@ -101,7 +103,6 @@ REQUIRED_COLUMNS = {
     "created_at",
 }
 
-# Nilai pengganti saat menyalin data dari skema lama yang mengizinkan NULL.
 NOT_NULL_FALLBACKS = {
     "custom_path": "''",
     "target_url": "''",
@@ -113,114 +114,204 @@ NOT_NULL_FALLBACKS = {
     "created_at": "CURRENT_TIMESTAMP",
 }
 
+LINK_FIELDS = (
+    "custom_path",
+    "target_url",
+    "title",
+    "description",
+    "image_url",
+    "site_name",
+    "clicks",
+    "created_at",
+)
+
 
 # ---------------------------------------------------------------------------
-# Database (lokal: SQLite | Vercel: Turso/libSQL)
+# Storage layer: satu interface untuk SQLite lokal dan MongoDB
 # ---------------------------------------------------------------------------
-class RemoteCursor:
-    """Cursor minimal dengan interface yang sama seperti sqlite3.Cursor."""
+class SQLiteStore:
+    def __init__(self, path):
+        self.path = path
 
-    def __init__(self, result):
-        self._rows = [row.asdict() for row in result.rows]
-        self.lastrowid = result.last_insert_rowid
+    @contextmanager
+    def _connection(self):
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
 
-    def fetchone(self):
-        return self._rows[0] if self._rows else None
+    def init(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with self._connection() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(links)")}
 
-    def fetchall(self):
-        return self._rows
+            if not columns:
+                db.execute(SCHEMA_SQL)
+            else:
+                if "custom_path" not in columns and "slug" in columns:
+                    db.execute("ALTER TABLE links RENAME COLUMN slug TO custom_path")
+                    columns = {row[1] for row in db.execute("PRAGMA table_info(links)")}
 
+                if not REQUIRED_COLUMNS.issubset(columns):
+                    db.execute("ALTER TABLE links RENAME TO links_legacy")
+                    db.execute(SCHEMA_SQL)
+                    ordered = sorted(REQUIRED_COLUMNS)
+                    names = ", ".join(ordered)
+                    selected = ", ".join(
+                        "COALESCE({0}, {1})".format(name, NOT_NULL_FALLBACKS[name])
+                        if name in columns and name in NOT_NULL_FALLBACKS
+                        else name
+                        if name in columns
+                        else NOT_NULL_FALLBACKS.get(name, "NULL")
+                        for name in ordered
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO links ({0}) SELECT {1} FROM links_legacy".format(
+                            names, selected
+                        )
+                    )
+                    db.execute("DROP TABLE links_legacy")
+            db.commit()
 
-class RemoteConnection:
-    """Adapter libSQL agar kode query SQLite tetap bisa dipakai apa adanya."""
+    def list_links(self):
+        with self._connection() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT * FROM links ORDER BY created_at DESC, id DESC"
+                )
+            ]
 
-    def __init__(self, url, token):
-        self._client = libsql_client.create_client_sync(url=url, auth_token=token)
+    def find_by_path(self, custom_path):
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT * FROM links WHERE custom_path = ?", (custom_path,)
+            ).fetchone()
+            return dict(row) if row else None
 
-    def execute(self, sql, params=()):
-        return RemoteCursor(self._client.execute(sql, list(params)))
+    def find_by_id(self, link_id):
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT * FROM links WHERE id = ?", (link_id,)
+            ).fetchone()
+            return dict(row) if row else None
 
-    def commit(self):
-        pass  # Koneksi remote berjalan dalam mode autocommit.
+    def path_exists(self, custom_path):
+        return self.find_by_path(custom_path) is not None
 
-    def close(self):
-        self._client.close()
-
-
-def get_db():
-    """Buka koneksi database khusus untuk request saat ini."""
-    if "db" not in g:
-        if app.config["REMOTE_DATABASE_URL"]:
-            g.db = RemoteConnection(
-                app.config["REMOTE_DATABASE_URL"],
-                app.config["REMOTE_DATABASE_TOKEN"],
+    def insert(self, data):
+        with self._connection() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO links
+                    (custom_path, target_url, title, description, image_url, site_name, clicks, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(data.get(field, "") for field in LINK_FIELDS),
             )
+            db.commit()
+            return cursor.lastrowid
+
+    def increment_clicks(self, link_id):
+        with self._connection() as db:
+            db.execute(
+                "UPDATE links SET clicks = clicks + 1 WHERE id = ?", (link_id,)
+            )
+            db.commit()
+
+    def delete(self, link_id):
+        with self._connection() as db:
+            db.execute("DELETE FROM links WHERE id = ?", (link_id,))
+            db.commit()
+
+
+class MongoStore:
+    """MongoDB Atlas. ID numerik tetap dipakai agar route /delete/<int:id> utuh."""
+
+    def __init__(self, uri, database_name):
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        self.collection = self.client[database_name]["links"]
+        self.counters = self.client[database_name]["counters"]
+
+    def init(self):
+        self.collection.create_index("custom_path", unique=True)
+
+    @staticmethod
+    def _public(document):
+        if not document:
+            return None
+        data = dict(document)
+        data.pop("_id", None)
+        return data
+
+    @staticmethod
+    def _now():
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    def list_links(self):
+        documents = self.collection.find().sort([("created_at", -1), ("id", -1)])
+        return [self._public(doc) for doc in documents]
+
+    def find_by_path(self, custom_path):
+        return self._public(self.collection.find_one({"custom_path": custom_path}))
+
+    def find_by_id(self, link_id):
+        return self._public(self.collection.find_one({"id": link_id}))
+
+    def path_exists(self, custom_path):
+        return self.collection.find_one(
+            {"custom_path": custom_path}, {"_id": 1}
+        ) is not None
+
+    def insert(self, data):
+        counter = self.counters.find_one_and_update(
+            {"_id": "links"},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        document = {field: data.get(field, "") for field in LINK_FIELDS}
+        document["id"] = counter["seq"]
+        document.setdefault("created_at", self._now())
+        self.collection.insert_one(document)
+        return document["id"]
+
+    def increment_clicks(self, link_id):
+        self.collection.update_one({"id": link_id}, {"$inc": {"clicks": 1}})
+
+    def delete(self, link_id):
+        self.collection.delete_one({"id": link_id})
+
+
+_store = None
+_store_ready = False
+
+
+def get_store():
+    global _store, _store_ready
+    if _store is None:
+        if app.config["MONGODB_URI"]:
+            _store = MongoStore(app.config["MONGODB_URI"], app.config["MONGODB_DB"])
         else:
-            g.db = sqlite3.connect(app.config["DATABASE"])
-            g.db.row_factory = sqlite3.Row
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(error=None):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
+            _store = SQLiteStore(app.config["DATABASE"])
+    if not _store_ready:
+        try:
+            _store.init()
+            _store_ready = True
+        except (PyMongoError, OSError, sqlite3.Error):
+            # Dicoba lagi pada request berikutnya saat database sudah tersedia.
+            pass
+    return _store
 
 
 def init_db():
-    """Buat tabel baru atau migrasi skema lama tanpa kehilangan data."""
-    if app.config["REMOTE_DATABASE_URL"]:
-        db = RemoteConnection(
-            app.config["REMOTE_DATABASE_URL"],
-            app.config["REMOTE_DATABASE_TOKEN"],
-        )
-        try:
-            db.execute(SCHEMA_SQL)
-            db.commit()
-        finally:
-            db.close()
-        return
-
-    os.makedirs(os.path.dirname(app.config["DATABASE"]), exist_ok=True)
-
-    # Koneksi sendiri agar bisa dipanggil di luar application context.
-    db = sqlite3.connect(app.config["DATABASE"])
-    try:
-        columns = {row[1] for row in db.execute("PRAGMA table_info(links)")}
-
-        if not columns:
-            db.execute(SCHEMA_SQL)
-        else:
-            # Skema lama memakai kolom "slug" -> rename menjadi "custom_path".
-            if "custom_path" not in columns and "slug" in columns:
-                db.execute("ALTER TABLE links RENAME COLUMN slug TO custom_path")
-                columns = {row[1] for row in db.execute("PRAGMA table_info(links)")}
-
-            # Bentuk skema lain: bangun ulang tabel dan salin kolom yang cocok.
-            if not REQUIRED_COLUMNS.issubset(columns):
-                db.execute("ALTER TABLE links RENAME TO links_legacy")
-                db.execute(SCHEMA_SQL)
-                ordered = sorted(REQUIRED_COLUMNS)
-                names = ", ".join(ordered)
-                selected = ", ".join(
-                    "COALESCE({0}, {1})".format(name, NOT_NULL_FALLBACKS[name])
-                    if name in columns and name in NOT_NULL_FALLBACKS
-                    else name
-                    if name in columns
-                    else NOT_NULL_FALLBACKS.get(name, "NULL")
-                    for name in ordered
-                )
-                db.execute(
-                    "INSERT OR IGNORE INTO links ({0}) SELECT {1} FROM links_legacy".format(
-                        names, selected
-                    )
-                )
-                db.execute("DROP TABLE links_legacy")
-
-        db.commit()
-    finally:
-        db.close()
+    """Inisialisasi ulang storage (dipakai saat startup & pengujian)."""
+    global _store, _store_ready
+    _store = None
+    _store_ready = False
+    return get_store()
 
 
 init_db()
@@ -230,7 +321,6 @@ init_db()
 # Helper
 # ---------------------------------------------------------------------------
 def is_http_url(value):
-    """Terima hanya URL dengan skema http:// atau https://."""
     try:
         parsed = urlparse(value.strip())
     except ValueError:
@@ -239,7 +329,6 @@ def is_http_url(value):
 
 
 def normalize_custom_path(raw):
-    """Bersihkan slash di awal/akhir dan rapikan slash ganda di tengah."""
     value = (raw or "").strip().strip("/")
     return re.sub(r"/+", "/", value)
 
@@ -249,15 +338,12 @@ def is_reserved_path(value):
     return first in RESERVED_SEGMENTS
 
 
-def generate_unique_path():
-    db = get_db()
+def generate_unique_path(store):
     while True:
         candidate = "".join(
             secrets.choice(RANDOM_ALPHABET) for _ in range(RANDOM_LENGTH)
         )
-        if db.execute(
-            "SELECT 1 FROM links WHERE custom_path = ?", (candidate,)
-        ).fetchone() is None:
+        if not store.path_exists(candidate):
             return candidate
 
 
@@ -267,7 +353,6 @@ def is_crawler():
 
 
 def meta_content(soup, key):
-    """Cari meta tag berdasarkan property maupun attribute name."""
     for attribute in ("property", "name"):
         tag = soup.find("meta", attrs={attribute: key})
         if tag and tag.get("content", "").strip():
@@ -276,7 +361,6 @@ def meta_content(soup, key):
 
 
 def fetch_metadata(target_url):
-    """Scrape OG metadata dengan fallback aman jika gagal."""
     parsed = urlparse(target_url)
     domain = parsed.netloc or target_url
     result = {
@@ -303,9 +387,7 @@ def fetch_metadata(target_url):
         title_tag = soup.find("title")
         page_title = title_tag.get_text(strip=True) if title_tag else ""
 
-        result["title"] = (
-            meta_content(soup, "og:title") or page_title or domain
-        )
+        result["title"] = meta_content(soup, "og:title") or page_title or domain
         result["description"] = (
             meta_content(soup, "og:description")
             or meta_content(soup, "description")
@@ -317,14 +399,12 @@ def fetch_metadata(target_url):
         if image:
             result["image_url"] = urljoin(response.url, image)
     except Exception:
-        # Scrape gagal (timeout, 404, encoding, dll.) -> pakai fallback.
         pass
 
     return result
 
 
 def absolute_image_url(image_url):
-    """Pastikan og:image selalu URL absolut/full."""
     if not image_url:
         return ""
     if image_url.startswith(("http://", "https://")):
@@ -337,9 +417,7 @@ def absolute_image_url(image_url):
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    links = get_db().execute(
-        "SELECT * FROM links ORDER BY created_at DESC, id DESC"
-    ).fetchall()
+    links = get_store().list_links()
     return render_template(
         "index.html",
         links=links,
@@ -365,10 +443,8 @@ def create():
             "Custom Link tidak boleh memakai nama route internal: create, delete, static, favicon.ico."
         )
 
-    db = get_db()
-    if custom_path and db.execute(
-        "SELECT 1 FROM links WHERE custom_path = ?", (custom_path,)
-    ).fetchone():
+    store = get_store()
+    if custom_path and store.path_exists(custom_path):
         errors.append("Custom Link tersebut sudah digunakan. Pilih yang lain atau kosongkan.")
 
     if errors:
@@ -377,25 +453,16 @@ def create():
         return redirect(url_for("index"))
 
     if not custom_path:
-        custom_path = generate_unique_path()
+        custom_path = generate_unique_path(store)
 
     metadata = fetch_metadata(target_url)
-    db.execute(
-        """
-        INSERT INTO links
-            (custom_path, target_url, title, description, image_url, site_name)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            custom_path,
-            target_url,
-            metadata["title"],
-            metadata["description"],
-            metadata["image_url"],
-            metadata["site_name"],
-        ),
-    )
-    db.commit()
+    data = dict(metadata)
+    data["custom_path"] = custom_path
+    data["target_url"] = target_url
+    data.setdefault("clicks", 0)
+    data.setdefault("created_at", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    store.insert(data)
+
     flash("Link berhasil dibuat: /{}".format(custom_path), "success")
     return redirect(url_for("index"))
 
@@ -403,47 +470,37 @@ def create():
 @app.route("/<path:custom_path>")
 def preview(custom_path):
     custom_path = custom_path.strip("/")
-    row = get_db().execute(
-        "SELECT * FROM links WHERE custom_path = ?", (custom_path,)
-    ).fetchone()
-    if row is None:
+    store = get_store()
+    link = store.find_by_path(custom_path)
+    if link is None:
         abort(404)
 
-    link = dict(row)
     bot = is_crawler()
-
     if not bot:
-        db = get_db()
-        db.execute("UPDATE links SET clicks = clicks + 1 WHERE id = ?", (link["id"],))
-        db.commit()
-        link["clicks"] += 1
+        store.increment_clicks(link["id"])
+        link["clicks"] = link.get("clicks", 0) + 1
 
-    link["og_image"] = absolute_image_url(link["image_url"])
+    link["og_image"] = absolute_image_url(link.get("image_url", ""))
     return render_template("preview.html", link=link, is_bot=bot)
 
 
 @app.post("/delete/<int:link_id>")
 def delete(link_id):
-    db = get_db()
-    row = db.execute(
-        "SELECT image_url FROM links WHERE id = ?", (link_id,)
-    ).fetchone()
+    store = get_store()
+    row = store.find_by_id(link_id)
     if row is None:
         abort(404)
 
-    image_url = row["image_url"]
-    db.execute("DELETE FROM links WHERE id = ?", (link_id,))
-    db.commit()
+    image_url = row.get("image_url", "")
+    store.delete(link_id)
 
-    # Bersihkan file gambar lokal lama jika tidak dipakai link lain.
     if image_url.startswith("static/uploads/"):
-        still_used = db.execute(
-            "SELECT 1 FROM links WHERE image_url = ?", (image_url,)
-        ).fetchone()
-        if still_used is None:
+        still_used = any(
+            item.get("image_url") == image_url for item in store.list_links()
+        )
+        if not still_used:
             file_path = os.path.join(
-                os.path.join(app.root_path, "static", "uploads"),
-                os.path.basename(image_url),
+                app.root_path, "static", "uploads", os.path.basename(image_url)
             )
             if os.path.isfile(file_path):
                 os.remove(file_path)
